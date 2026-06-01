@@ -2,9 +2,8 @@ name: Albo Pretorio Bot
 
 on:
   schedule:
-    # Ogni ora, dalle 7:00 alle 22:00 ora italiana (UTC+2 in estate)
     - cron: '0 5-20 * * *'
-  workflow_dispatch:  # Permette avvio manuale dal sito GitHub
+  workflow_dispatch:
 
 jobs:
   run-bot:
@@ -19,8 +18,11 @@ jobs:
         with:
           python-version: '3.11'
 
+      - name: Installa Chrome
+        uses: browser-actions/setup-chrome@v1
+
       - name: Installa dipendenze
-        run: pip install requests beautifulsoup4
+        run: pip install requests beautifulsoup4 selenium==4.18.1
 
       - name: Carica file atti già visti (cache)
         uses: actions/cache@v4
@@ -36,3 +38,10 @@ jobs:
           TELEGRAM_CHAT_ID:  ${{ secrets.TELEGRAM_CHAT_ID }}
           ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
         run: python bot.py
+
+      - name: Salva file atti già visti
+        uses: actions/cache/save@v4
+        if: always()
+        with:
+          path: seen_atti.json
+          key: seen-atti-${{ github.run_id }}
