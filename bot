@@ -1,0 +1,210 @@
+"""
+Bot Albo Pretorio - Comune di Agrigento
+Legge i nuovi atti, li analizza con AI e li manda su Telegram.
+"""
+
+import os
+import json
+import hashlib
+import requests
+from datetime import datetime
+from bs4 import BeautifulSoup
+
+# ── Configurazione ──────────────────────────────────────────────
+TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
+
+ALBO_URL = "https://servizionline.comune.agrigento.it/ServiziOnLine/AlboPretorio/AlboPretorio"
+SEEN_FILE = "seen_atti.json"
+
+HEADERS = {
+    "User-Agent": (
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
+        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
+    )
+}
+
+# ── Persistenza atti già visti ───────────────────────────────────
+def load_seen():
+    if os.path.exists(SEEN_FILE):
+        with open(SEEN_FILE) as f:
+            return set(json.load(f))
+    return set()
+
+def save_seen(seen: set):
+    with open(SEEN_FILE, "w") as f:
+        json.dump(list(seen), f)
+
+def atto_id(atto: dict) -> str:
+    key = f"{atto['numero']}_{atto['tipo']}_{atto['data']}"
+    return hashlib.md5(key.encode()).hexdigest()
+
+# ── Scraping ─────────────────────────────────────────────────────
+def fetch_atti() -> list[dict]:
+    try:
+        resp = requests.get(ALBO_URL, headers=HEADERS, timeout=20)
+        resp.raise_for_status()
+    except Exception as e:
+        print(f"[ERRORE] Fetch fallito: {e}")
+        return []
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    atti = []
+
+    # La pagina mostra gli atti come card/blocchi con titolo e descrizione
+    # Cerca tutti i link con testo che contiene numero/anno
+    for item in soup.find_all(["div", "li", "tr", "article"]):
+        testo = item.get_text(separator=" ", strip=True)
+
+        # Cerca pattern tipo "2582/2026 del 01/06/2026 - Determina Dirigenziale"
+        import re
+        match = re.search(
+            r"(\d{3,5}/\d{4})\s+del\s+(\d{2}/\d{2}/\d{4})\s*[-–]\s*([^\-–\d][^\n\r]{3,60})",
+            testo
+        )
+        if not match:
+            continue
+
+        numero = match.group(1).strip()
+        data   = match.group(2).strip()
+        tipo   = match.group(3).strip()
+
+        # Oggetto: testo dopo il tipo, ripulito
+        resto = testo[match.end():].strip()
+        oggetto = resto[:300] if resto else ""
+
+        # Cerca link all'atto
+        link_tag = item.find("a", href=True)
+        link = ""
+        if link_tag:
+            href = link_tag["href"]
+            link = href if href.startswith("http") else f"https://servizionline.comune.agrigento.it{href}"
+
+        atto = {
+            "numero":  numero,
+            "data":    data,
+            "tipo":    tipo,
+            "oggetto": oggetto,
+            "link":    link,
+        }
+
+        # Evita duplicati nella stessa sessione
+        uid = atto_id(atto)
+        if not any(atto_id(a) == uid for a in atti):
+            atti.append(atto)
+
+    print(f"[INFO] Trovati {len(atti)} atti")
+    return atti
+
+# ── Analisi AI ───────────────────────────────────────────────────
+def spiega_atto(atto: dict) -> str:
+    prompt = f"""Sei un assistente civico che spiega in modo semplice gli atti del Comune di Agrigento.
+
+Atto pubblicato sull'Albo Pretorio:
+- Numero: {atto['numero']}
+- Data: {atto['data']}
+- Tipo: {atto['tipo']}
+- Oggetto: {atto['oggetto']}
+
+Scrivi UNA spiegazione breve (2-3 frasi max) in italiano semplice, rivolta ai cittadini.
+Spiega cosa significa questo atto concretamente. Niente burocrazia, niente tecnicismi.
+Non iniziare con "Questo atto" o frasi simili. Vai diretto al punto."""
+
+    try:
+        resp = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={
+                "x-api-key": ANTHROPIC_API_KEY,
+                "anthropic-version": "2023-06-01",
+                "content-type": "application/json",
+            },
+            json={
+                "model": "claude-haiku-4-5-20251001",
+                "max_tokens": 200,
+                "messages": [{"role": "user", "content": prompt}],
+            },
+            timeout=15,
+        )
+        resp.raise_for_status()
+        return resp.json()["content"][0]["text"].strip()
+    except Exception as e:
+        print(f"[ERRORE] AI fallita: {e}")
+        return ""
+
+# ── Formattazione messaggio Telegram ────────────────────────────
+EMOJI = {
+    "Determina Dirigenziale":  "📋",
+    "Determina Sindacale":     "📋",
+    "Delibera di Consiglio":   "🏛️",
+    "Delibera di Giunta":      "🏛️",
+    "Ordinanza Dirigenziale":  "⚠️",
+    "Ordinanza Sindacale":     "⚠️",
+    "Permesso edilizio":       "🏗️",
+    "Concorsi":                "👔",
+    "Pubblicazioni di matrimonio": "💍",
+    "Avviso":                  "📢",
+    "Varie":                   "📌",
+}
+
+def formato_messaggio(atto: dict, spiegazione: str) -> str:
+    emoji = next((v for k, v in EMOJI.items() if k.lower() in atto["tipo"].lower()), "📌")
+
+    msg = f"{emoji} *{atto['tipo']}* — {atto['numero']}\n"
+    msg += f"📅 {atto['data']}\n\n"
+
+    if atto["oggetto"]:
+        msg += f"_{atto['oggetto'][:200]}_\n\n"
+
+    if spiegazione:
+        msg += f"💬 {spiegazione}\n"
+
+    if atto["link"]:
+        msg += f"\n🔗 [Leggi l'atto]({atto['link']})"
+
+    msg += "\n\n_Comune di Agrigento — Albo Pretorio_"
+    return msg
+
+# ── Invio Telegram ───────────────────────────────────────────────
+def invia_telegram(testo: str) -> bool:
+    url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+    try:
+        resp = requests.post(url, json={
+            "chat_id": TELEGRAM_CHAT_ID,
+            "text": testo,
+            "parse_mode": "Markdown",
+            "disable_web_page_preview": True,
+        }, timeout=10)
+        resp.raise_for_status()
+        return True
+    except Exception as e:
+        print(f"[ERRORE] Telegram fallito: {e}")
+        return False
+
+# ── Main ─────────────────────────────────────────────────────────
+def main():
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Avvio controllo albo...")
+
+    seen  = load_seen()
+    atti  = fetch_atti()
+    nuovi = [a for a in atti if atto_id(a) not in seen]
+
+    print(f"[INFO] Atti nuovi: {len(nuovi)}")
+
+    # Manda al massimo 10 atti per ciclo (evita spam)
+    for atto in nuovi[:10]:
+        print(f"[INFO] Processo: {atto['numero']} - {atto['tipo']}")
+        spiegazione = spiega_atto(atto)
+        messaggio   = formato_messaggio(atto, spiegazione)
+
+        if invia_telegram(messaggio):
+            seen.add(atto_id(atto))
+            print(f"[OK] Inviato: {atto['numero']}")
+        else:
+            print(f"[ERRORE] Non inviato: {atto['numero']}")
+
+    save_seen(seen)
+    print(f"[FINE] Totale atti tracciati: {len(seen)}")
+
+if __name__ == "__main__":
+    main()
