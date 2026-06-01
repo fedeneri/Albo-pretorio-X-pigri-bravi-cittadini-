@@ -1,29 +1,28 @@
 """
 Bot Albo Pretorio - Comune di Agrigento
-Legge i nuovi atti, li analizza con AI e li manda su Telegram.
+Usa Selenium per caricare la pagina JavaScript, analizza con AI e manda su Telegram.
 """
 
 import os
 import json
 import hashlib
 import requests
+import time
 from datetime import datetime
 from bs4 import BeautifulSoup
+from selenium import webdriver
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
 
 # ── Configurazione ──────────────────────────────────────────────
-TELEGRAM_TOKEN   = os.environ["TELEGRAM_TOKEN"]
-TELEGRAM_CHAT_ID = os.environ["TELEGRAM_CHAT_ID"]
+TELEGRAM_TOKEN    = os.environ["TELEGRAM_TOKEN"]
+TELEGRAM_CHAT_ID  = os.environ["TELEGRAM_CHAT_ID"]
 ANTHROPIC_API_KEY = os.environ["ANTHROPIC_API_KEY"]
 
-ALBO_URL = "https://servizionline.comune.agrigento.it/ServiziOnLine/AlboPretorio/AlboPretorio"
+ALBO_URL  = "https://servizionline.comune.agrigento.it/ServiziOnLine/AlboPretorio/AlboPretorio"
 SEEN_FILE = "seen_atti.json"
-
-HEADERS = {
-    "User-Agent": (
-        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) "
-        "AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1"
-    )
-}
 
 # ── Persistenza atti già visti ───────────────────────────────────
 def load_seen():
@@ -40,28 +39,47 @@ def atto_id(atto: dict) -> str:
     key = f"{atto['numero']}_{atto['tipo']}_{atto['data']}"
     return hashlib.md5(key.encode()).hexdigest()
 
-# ── Scraping ─────────────────────────────────────────────────────
+# ── Selenium scraping ─────────────────────────────────────────────
 def fetch_atti() -> list[dict]:
+    options = Options()
+    options.add_argument("--headless")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
+    options.add_argument(
+        "user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+    )
+
+    driver = None
     try:
-        resp = requests.get(ALBO_URL, headers=HEADERS, timeout=20)
-        resp.raise_for_status()
+        driver = webdriver.Chrome(options=options)
+        driver.get(ALBO_URL)
+
+        # Aspetta che la pagina carichi gli atti (max 15 secondi)
+        time.sleep(8)
+
+        html = driver.page_source
     except Exception as e:
-        print(f"[ERRORE] Fetch fallito: {e}")
+        print(f"[ERRORE] Selenium: {e}")
         return []
+    finally:
+        if driver:
+            driver.quit()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(html, "html.parser")
     atti = []
+    import re
 
-    # La pagina mostra gli atti come card/blocchi con titolo e descrizione
-    # Cerca tutti i link con testo che contiene numero/anno
-    for item in soup.find_all(["div", "li", "tr", "article"]):
-        testo = item.get_text(separator=" ", strip=True)
-
-        # Cerca pattern tipo "2582/2026 del 01/06/2026 - Determina Dirigenziale"
-        import re
+    # Cerca tutti i blocchi con pattern numero/anno
+    testo_pagina = soup.get_text(separator="\n")
+    
+    for line in testo_pagina.split("\n"):
+        line = line.strip()
         match = re.search(
             r"(\d{3,5}/\d{4})\s+del\s+(\d{2}/\d{2}/\d{4})\s*[-–]\s*([^\-–\d][^\n\r]{3,60})",
-            testo
+            line
         )
         if not match:
             continue
@@ -69,28 +87,10 @@ def fetch_atti() -> list[dict]:
         numero = match.group(1).strip()
         data   = match.group(2).strip()
         tipo   = match.group(3).strip()
+        oggetto = line[match.end():].strip()[:300]
 
-        # Oggetto: testo dopo il tipo, ripulito
-        resto = testo[match.end():].strip()
-        oggetto = resto[:300] if resto else ""
-
-        # Cerca link all'atto
-        link_tag = item.find("a", href=True)
-        link = ""
-        if link_tag:
-            href = link_tag["href"]
-            link = href if href.startswith("http") else f"https://servizionline.comune.agrigento.it{href}"
-
-        atto = {
-            "numero":  numero,
-            "data":    data,
-            "tipo":    tipo,
-            "oggetto": oggetto,
-            "link":    link,
-        }
-
-        # Evita duplicati nella stessa sessione
-        uid = atto_id(atto)
+        atto = {"numero": numero, "data": data, "tipo": tipo, "oggetto": oggetto, "link": ALBO_URL}
+        uid  = atto_id(atto)
         if not any(atto_id(a) == uid for a in atti):
             atti.append(atto)
 
@@ -129,39 +129,33 @@ Non iniziare con "Questo atto" o frasi simili. Vai diretto al punto."""
         resp.raise_for_status()
         return resp.json()["content"][0]["text"].strip()
     except Exception as e:
-        print(f"[ERRORE] AI fallita: {e}")
+        print(f"[ERRORE] AI: {e}")
         return ""
 
-# ── Formattazione messaggio Telegram ────────────────────────────
+# ── Formattazione messaggio ──────────────────────────────────────
 EMOJI = {
-    "Determina Dirigenziale":  "📋",
-    "Determina Sindacale":     "📋",
-    "Delibera di Consiglio":   "🏛️",
-    "Delibera di Giunta":      "🏛️",
-    "Ordinanza Dirigenziale":  "⚠️",
-    "Ordinanza Sindacale":     "⚠️",
-    "Permesso edilizio":       "🏗️",
-    "Concorsi":                "👔",
-    "Pubblicazioni di matrimonio": "💍",
-    "Avviso":                  "📢",
-    "Varie":                   "📌",
+    "determina dirigenziale": "📋",
+    "determina sindacale":    "📋",
+    "delibera di consiglio":  "🏛️",
+    "delibera di giunta":     "🏛️",
+    "ordinanza":              "⚠️",
+    "permesso edilizio":      "🏗️",
+    "concorsi":               "👔",
+    "matrimonio":             "💍",
+    "avviso":                 "📢",
 }
 
 def formato_messaggio(atto: dict, spiegazione: str) -> str:
-    emoji = next((v for k, v in EMOJI.items() if k.lower() in atto["tipo"].lower()), "📌")
+    tipo_lower = atto["tipo"].lower()
+    emoji = next((v for k, v in EMOJI.items() if k in tipo_lower), "📌")
 
-    msg = f"{emoji} *{atto['tipo']}* — {atto['numero']}\n"
+    msg  = f"{emoji} *{atto['tipo']}* — {atto['numero']}\n"
     msg += f"📅 {atto['data']}\n\n"
-
     if atto["oggetto"]:
         msg += f"_{atto['oggetto'][:200]}_\n\n"
-
     if spiegazione:
         msg += f"💬 {spiegazione}\n"
-
-    if atto["link"]:
-        msg += f"\n🔗 [Leggi l'atto]({atto['link']})"
-
+    msg += f"\n🔗 [Vai all'Albo Pretorio]({ALBO_URL})"
     msg += "\n\n_Comune di Agrigento — Albo Pretorio_"
     return msg
 
@@ -170,20 +164,20 @@ def invia_telegram(testo: str) -> bool:
     url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
     try:
         resp = requests.post(url, json={
-            "chat_id": TELEGRAM_CHAT_ID,
-            "text": testo,
-            "parse_mode": "Markdown",
+            "chat_id":                  TELEGRAM_CHAT_ID,
+            "text":                     testo,
+            "parse_mode":               "Markdown",
             "disable_web_page_preview": True,
         }, timeout=10)
         resp.raise_for_status()
         return True
     except Exception as e:
-        print(f"[ERRORE] Telegram fallito: {e}")
+        print(f"[ERRORE] Telegram: {e}")
         return False
 
 # ── Main ─────────────────────────────────────────────────────────
 def main():
-    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Avvio controllo albo...")
+    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M')}] Avvio...")
 
     seen  = load_seen()
     atti  = fetch_atti()
@@ -191,7 +185,11 @@ def main():
 
     print(f"[INFO] Atti nuovi: {len(nuovi)}")
 
-    # Manda al massimo 10 atti per ciclo (evita spam)
+    # Prima esecuzione: manda solo i primi 3 come test
+    if not seen and nuovi:
+        print("[INFO] Prima esecuzione — mando i primi 3 come test")
+        nuovi = nuovi[:3]
+
     for atto in nuovi[:10]:
         print(f"[INFO] Processo: {atto['numero']} - {atto['tipo']}")
         spiegazione = spiega_atto(atto)
@@ -204,4 +202,7 @@ def main():
             print(f"[ERRORE] Non inviato: {atto['numero']}")
 
     save_seen(seen)
-    print(f"[FINE] Totale atti tracciati: {len(seen)}")
+    print(f"[FINE] Atti tracciati: {len(seen)}")
+
+if __name__ == "__main__":
+    main()
